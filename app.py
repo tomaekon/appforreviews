@@ -3,7 +3,8 @@ App Store Reviews Downloader
 =============================
 
 Внутренний инструмент для быстрой выгрузки отзывов пользователей из Apple
-App Store по всем доступным регионам за последний месяц.
+App Store по всем доступным регионам за последний месяц или 2 месяца
+(на выбор; отсчёт от текущего момента).
 На вход подаётся только числовой ID приложения.
 
 Источник данных: публичный JSON RSS-фид Apple "customer reviews"
@@ -15,7 +16,7 @@ apps.apple.com и множеством open-source инструментов дл
 ВАЖНОЕ ОГРАНИЧЕНИЕ ИСТОЧНИКА ДАННЫХ (см. README.md, раздел "Ограничения Apple"):
 Apple отдаёт не более ~10 страниц по 50 отзывов (то есть не более примерно
 500 самых новых отзывов) на каждую пару "приложение + регион". Если за
-последний месяц в конкретном регионе было оставлено больше отзывов, чем
+выбранный период в конкретном регионе было оставлено больше отзывов, чем
 покрывает это ограничение, самые старые из них в это окно физически не
 попадут — это ограничение самого источника данных, а не этого кода.
 Приложение честно сообщает об этом и никогда не утверждает, что получены
@@ -67,7 +68,15 @@ BACKOFF_BASE_SECONDS = 1.0
 REQUEST_TIMEOUT_SECONDS = 15
 MAX_PAGES_PER_STOREFRONT = 10  # техническое ограничение Apple
 MAX_WORKERS = 8
-PERIOD_MONTHS = 1
+PERIOD_MONTHS = 1  # период по умолчанию (в месяцах)
+PERIOD_OPTIONS = (1, 2)  # доступные в интерфейсе периоды (в месяцах)
+
+# Контрольная проверка источника: у очень популярного приложения всегда есть
+# свежие отзывы. Используется ТОЛЬКО для диагностики, когда по вашему
+# приложению найдено 0 отзывов (чтобы отличить "отзывов нет" от
+# "фид Apple не работает"). На результат загрузки не влияет.
+HEALTHCHECK_APP_ID = "310633997"  # WhatsApp Messenger
+HEALTHCHECK_COUNTRIES = ("us", "gb")
 
 REQUIRED_COLUMNS = [
     "review_text",
@@ -200,6 +209,16 @@ def check_app_exists(app_id: str) -> bool:
 # ---------------------------------------------------------------------------
 # Работа с датами
 # ---------------------------------------------------------------------------
+
+def period_label(months: int) -> str:
+    """Название периода для переключателя: "1 месяц", "2 месяца"."""
+    return "1 месяц" if months == 1 else f"{months} месяца"
+
+
+def period_phrase(months: int) -> str:
+    """Фраза для сообщений: "за последний месяц", "за последние 2 месяца"."""
+    return "за последний месяц" if months == 1 else f"за последние {months} месяца"
+
 
 def subtract_months(dt: datetime, months: int) -> datetime:
     """Календарно корректно вычитает N месяцев из даты (с учётом длины месяца)."""
@@ -474,11 +493,12 @@ def fetch_all_reviews(
     progress_callback=None,
     stop_event: Optional[threading.Event] = None,
     now: Optional[datetime] = None,
+    period_months: int = PERIOD_MONTHS,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Проходит по выбранным регионам (умеренно параллельно; если countries
     не задан — по всем), собирает и фильтрует отзывы за последние
-    PERIOD_MONTHS месяцев.
+    period_months месяцев (от момента now, по умолчанию — от текущего).
 
     Ошибка одного региона не останавливает остальные (partial success).
     Если выставлен stop_event, новые регионы не запускаются, а уже
@@ -489,7 +509,7 @@ def fetch_all_reviews(
     total = len(countries)
 
     now = now or datetime.now(timezone.utc)
-    cutoff = subtract_months(now, PERIOD_MONTHS)
+    cutoff = subtract_months(now, period_months)
 
     all_reviews: List[dict] = []
     failed_regions: List[dict] = []
@@ -537,6 +557,33 @@ def fetch_all_reviews(
     return all_reviews, failed_regions
 
 
+def check_review_source_health(session: Optional[requests.Session] = None) -> Optional[bool]:
+    """
+    Контрольная проверка источника: отдаёт ли фид Apple отзывы для заведомо
+    популярного приложения.
+
+    True  — отзывы получены, источник работает;
+    False — фид отвечает (HTTP 200/404), но отзывов нет ни на одной странице
+            ни в одной контрольной стране: вероятно, Apple перестал отдавать
+            отзывы через этот фид;
+    None  — проверить не удалось (сетевая/HTTP-ошибка): вывода делать нельзя.
+
+    Просматриваются все страницы, а не только первая: у фида бывают
+    "дыры" (пустая страница, за которой идут непустые).
+    """
+    session = session or requests.Session()
+    for country in HEALTHCHECK_COUNTRIES:
+        for page in range(1, MAX_PAGES_PER_STOREFRONT + 1):
+            url = _build_feed_url(HEALTHCHECK_APP_ID, country, page)
+            entries, error = _fetch_page_with_retry(url, session)
+            if entries is None:
+                logger.warning("Контрольная проверка источника не удалась: %s", error)
+                return None
+            if entries:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Фоновая задача загрузки (позволяет показывать прогресс и нажимать "Стоп")
 # ---------------------------------------------------------------------------
@@ -548,8 +595,11 @@ class FetchJob:
     от интерфейса не зависит.
     """
 
-    def __init__(self, app_id: str, countries: List[str]) -> None:
+    def __init__(
+        self, app_id: str, countries: List[str], period_months: int = PERIOD_MONTHS
+    ) -> None:
         self.app_id = app_id
+        self.period_months = period_months
         self.countries = list(countries)
         self.total = len(self.countries)
         self.started_at = datetime.now(timezone.utc)
@@ -607,6 +657,7 @@ class FetchJob:
                 progress_callback=self._on_progress,
                 stop_event=self.stop_event,
                 now=self.started_at,
+                period_months=self.period_months,
             )
             with self._lock:
                 self.reviews = reviews
@@ -726,15 +777,25 @@ def _finalize_job(job: FetchJob) -> None:
     )
 
     df = sort_reviews(build_dataframe(reviews))
-    cutoff = subtract_months(job.started_at, PERIOD_MONTHS)
+    cutoff = subtract_months(job.started_at, job.period_months)
     problems = validate_dataframe(df, cutoff, datetime.now(timezone.utc))
     if problems:
         logger.error("Проблемы валидации данных перед экспортом: %s", problems)
 
+    # Если отзывов 0 — выясняем, это "отзывов нет" или "источник не работает".
+    source_status = None
+    if df.empty and not job.was_stopped and not job.crashed:
+        with st.spinner("Проверяем доступность источника данных..."):
+            health = check_review_source_health()
+        source_status = {True: "ok", False: "dead"}.get(health, "unknown")
+        logger.info("Контрольная проверка источника: %s", source_status)
+
     snap = job.snapshot()
+    st.session_state["source_status"] = source_status
     st.session_state["result_df"] = df
     st.session_state["failed_regions"] = failed_regions
     st.session_state["app_id"] = job.app_id
+    st.session_state["period_months"] = job.period_months
     st.session_state["total_countries"] = job.total
     st.session_state["processed_regions"] = snap["processed"]
     st.session_state["was_stopped"] = job.was_stopped
@@ -771,7 +832,24 @@ def _show_results() -> None:
         st.success("Сбор завершён.\n\n" + summary)
 
     if df.empty:
-        st.info("За последний месяц отзывы не найдены.")
+        source_status = st.session_state.get("source_status")
+        if source_status == "dead":
+            st.error(
+                "Публичный фид отзывов Apple отвечает, но не отдаёт ни одного "
+                "отзыва даже для контрольного популярного приложения. Скорее "
+                "всего, Apple перестал отдавать отзывы через этот источник, "
+                "а не у вашего приложения их нет. Приложение само это "
+                "исправить не может: нужен другой источник данных "
+                "(см. README, раздел «Ограничения Apple»)."
+            )
+        else:
+            period_months = st.session_state.get("period_months", PERIOD_MONTHS)
+            st.info(f"{period_phrase(period_months).capitalize()} отзывы не найдены.")
+            if source_status == "unknown":
+                st.caption(
+                    "Не удалось выполнить контрольную проверку источника "
+                    "данных, поэтому исключить сбой на стороне Apple нельзя."
+                )
     else:
         st.dataframe(_format_display_dataframe(df), use_container_width=True)
         filename, csv_bytes = export_csv(df, app_id)
@@ -791,7 +869,7 @@ def _show_results() -> None:
     st.caption(
         "Источник: публичный RSS-фид отзывов Apple. Он отдаёт не более "
         "~500 самых новых отзывов на регион, поэтому если в каком-то "
-        "регионе за месяц отзывов оставлено больше — часть самых "
+        "регионе за выбранный период отзывов оставлено больше — часть самых "
         "старых из них физически недоступна через этот источник."
     )
 
@@ -801,8 +879,8 @@ def main() -> None:
     st.title("App Store Reviews Downloader")
     st.caption(
         "Введите ID приложения из Apple App Store и получите CSV со всеми "
-        "доступными отзывами за последний месяц. Страны можно ограничить "
-        "(по умолчанию — все)."
+        "доступными отзывами за последний месяц или 2 месяца. Страны можно "
+        "ограничить (по умолчанию — все)."
     )
 
     job: Optional[FetchJob] = st.session_state.get("job")
@@ -823,11 +901,22 @@ def main() -> None:
              "Выбор нескольких стран заметно ускоряет сбор.",
         disabled=running,
     )
+    period_months = st.radio(
+        "Период (от сегодняшнего дня)",
+        options=list(PERIOD_OPTIONS),
+        format_func=period_label,
+        index=PERIOD_OPTIONS.index(PERIOD_MONTHS),
+        horizontal=True,
+        help="За какой период собирать отзывы. Чем длиннее период, тем больше "
+             "отзывов может не поместиться в лимит Apple (~500 на страну).",
+        disabled=running,
+    )
     start_clicked = st.button("Получить отзывы", type="primary", disabled=running)
 
     if start_clicked and not running:
         for key in ("result_df", "failed_regions", "app_id", "processed_regions",
-                    "total_countries", "was_stopped", "crashed"):
+                    "total_countries", "was_stopped", "crashed", "source_status",
+                    "period_months"):
             st.session_state.pop(key, None)
 
         if not raw_app_id or not raw_app_id.strip():
@@ -853,8 +942,11 @@ def main() -> None:
             return
 
         countries_to_fetch = normalize_countries(selected_countries)
-        logger.info("Начало сбора отзывов для app_id=%s, стран: %d", app_id, len(countries_to_fetch))
-        job = FetchJob(app_id, countries_to_fetch)
+        logger.info(
+            "Начало сбора отзывов для app_id=%s, стран: %d, период: %d мес.",
+            app_id, len(countries_to_fetch), period_months,
+        )
+        job = FetchJob(app_id, countries_to_fetch, period_months)
         st.session_state["job"] = job
         job.start()
 

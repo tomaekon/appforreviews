@@ -75,8 +75,15 @@ class TestDateHandling(unittest.TestCase):
         self.assertIsNone(app.parse_review_date(""))
         self.assertIsNone(app.parse_review_date(None))
 
-    def test_period_is_one_month(self):
+    def test_default_period_is_one_month_and_two_is_available(self):
         self.assertEqual(app.PERIOD_MONTHS, 1)
+        self.assertEqual(app.PERIOD_OPTIONS, (1, 2))
+
+    def test_period_labels(self):
+        self.assertEqual(app.period_label(1), "1 месяц")
+        self.assertEqual(app.period_label(2), "2 месяца")
+        self.assertEqual(app.period_phrase(1), "за последний месяц")
+        self.assertEqual(app.period_phrase(2), "за последние 2 месяца")
 
     def test_filter_reviews_by_date(self):
         # Test 14: отзывы старше периода отфильтровываются
@@ -505,6 +512,128 @@ class TestStopButton(unittest.TestCase):
 class TestUiSmoke(unittest.TestCase):
     def test_main_renders_without_errors(self):
         app.main()
+
+
+class TestSourceHealthCheck(unittest.TestCase):
+    ENTRY = {
+        "id": {"label": "1"}, "title": {"label": "T"}, "content": {"label": "C"},
+        "im:rating": {"label": "5"}, "updated": {"label": "2026-10-01T00:00:00Z"},
+    }
+
+    def test_healthy_when_a_later_page_has_reviews(self):
+        # "дыры" в фиде: страницы 1-2 пустые, на 3-й есть отзывы
+        pages = [([], None), ([], None), ([self.ENTRY], None)]
+        with patch.object(app, "_fetch_page_with_retry", side_effect=pages):
+            self.assertTrue(app.check_review_source_health(MagicMock()))
+
+    def test_dead_when_every_page_is_empty(self):
+        n = len(app.HEALTHCHECK_COUNTRIES) * app.MAX_PAGES_PER_STOREFRONT
+        with patch.object(app, "_fetch_page_with_retry", side_effect=[([], None)] * n):
+            self.assertFalse(app.check_review_source_health(MagicMock()))
+
+    def test_unknown_on_network_error(self):
+        with patch.object(app, "_fetch_page_with_retry", return_value=(None, "timeout")):
+            self.assertIsNone(app.check_review_source_health(MagicMock()))
+
+
+class TestResultsScreen(unittest.TestCase):
+    """Дымовые проверки экранов результата (со Streamlit-заглушкой)."""
+
+    def setUp(self):
+        app.st.session_state.clear()
+
+    def _state(self, df, **extra):
+        app.st.session_state.update(
+            result_df=df, failed_regions=[], app_id="123456789", total_countries=3,
+            processed_regions=3, was_stopped=False, crashed=False, **extra)
+
+    def test_show_results_all_variants(self):
+        empty = app.build_dataframe([])
+        for status in (None, "ok", "dead", "unknown"):
+            app.st.session_state.clear()
+            self._state(empty, source_status=status)
+            app._show_results()
+        app.st.session_state.clear()
+        self._state(app.sort_reviews(app.build_dataframe([{
+            "review_text": "x", "rating": 5, "title": "t", "country": "us", "language": "en",
+            "publication_date": datetime.now(timezone.utc)}])))
+        app._show_results()
+        app.st.session_state["was_stopped"] = True
+        app._show_results()
+
+    def test_finalize_runs_health_check_only_when_empty(self):
+        with patch.object(app, "fetch_reviews_for_storefront", return_value=([], None)):
+            job = app.FetchJob("123456789", ["us"])
+            job.start()
+            self.assertTrue(job.done_event.wait(5))
+        with patch.object(app, "check_review_source_health", return_value=False) as hc:
+            app._finalize_job(job)
+        hc.assert_called_once()
+        self.assertEqual(app.st.session_state["source_status"], "dead")
+
+    def test_finalize_skips_health_check_when_stopped(self):
+        job = app.FetchJob("123456789", ["us"])
+        job.stop_event.set()
+        job.done_event.set()
+        with patch.object(app, "check_review_source_health") as hc:
+            app._finalize_job(job)
+        hc.assert_not_called()
+        self.assertIsNone(app.st.session_state["source_status"])
+
+
+class TestPeriodSelection(unittest.TestCase):
+    """Отзывы 5, 45 и 70 дней назад: 1 месяц -> 1 отзыв, 2 месяца -> 2 отзыва."""
+
+    def _entries(self):
+        def e(i, days):
+            when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            return {"id": {"label": str(i)}, "title": {"label": "T"}, "content": {"label": f"R{i}"},
+                    "im:rating": {"label": "5"}, "updated": {"label": when}}
+        return [e(1, 5), e(2, 45), e(3, 70)]
+
+    def _fake(self):
+        entries = self._entries()
+        return lambda app_id, country, session, stop_event=None: (list(entries), None)
+
+    def test_one_month_default(self):
+        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
+            reviews, _ = app.fetch_all_reviews("123456789", countries=["us"])
+        self.assertEqual(sorted(r["review_text"] for r in reviews), ["R1"])
+
+    def test_two_months(self):
+        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
+            reviews, _ = app.fetch_all_reviews("123456789", countries=["us"], period_months=2)
+        self.assertEqual(sorted(r["review_text"] for r in reviews), ["R1", "R2"])
+
+    def test_job_passes_period_through(self):
+        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
+            job = app.FetchJob("123456789", ["us"], period_months=2)
+            job.start()
+            self.assertTrue(job.done_event.wait(5))
+        self.assertEqual(job.period_months, 2)
+        self.assertEqual(len(job.reviews), 2)
+
+    def test_finalize_validates_against_job_period(self):
+        # при 2 месяцах отзыв 45-дневной давности — не ошибка валидации
+        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
+            job = app.FetchJob("123456789", ["us"], period_months=2)
+            job.start()
+            self.assertTrue(job.done_event.wait(5))
+        with patch.object(app.logger, "error") as log_error:
+            app._finalize_job(job)
+        log_error.assert_not_called()
+        self.assertEqual(app.st.session_state["period_months"], 2)
+        self.assertEqual(len(app.st.session_state["result_df"]), 2)
+
+    def test_empty_message_uses_selected_period(self):
+        app.st.session_state.clear()
+        app.st.session_state.update(
+            result_df=app.build_dataframe([]), failed_regions=[], app_id="1", total_countries=1,
+            processed_regions=1, was_stopped=False, crashed=False, source_status="ok",
+            period_months=2)
+        with patch.object(app.st, "info") as info:
+            app._show_results()
+        info.assert_called_once_with("За последние 2 месяца отзывы не найдены.")
 
 
 class TestLanguageDetectionFallback(unittest.TestCase):
