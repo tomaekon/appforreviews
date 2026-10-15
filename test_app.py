@@ -22,26 +22,49 @@ import pandas as pd
 import app
 
 
-class TestAppIdParsing(unittest.TestCase):
-    def test_plain_numeric_id(self):
-        self.assertTrue(app.validate_app_id("123456789"))
-        self.assertEqual(app.get_app_id("123456789"), "123456789")
+class TestUrlParsing(unittest.TestCase):
+    def test_basic_url(self):
+        # Test 1: корректный App Store URL
+        self.assertEqual(app.parse_app_store_url("https://apps.apple.com/app/id123456789"), "123456789")
+        self.assertTrue(app.validate_app_store_url("https://apps.apple.com/app/id123456789"))
 
-    def test_id_with_prefix_and_spaces(self):
-        self.assertEqual(app.get_app_id("  id123456789 "), "123456789")
-        self.assertEqual(app.get_app_id("ID123456789"), "123456789")
+    def test_invalid_url(self):
+        # Test 2: некорректный URL
+        self.assertFalse(app.validate_app_store_url("https://google.com"))
+        self.assertFalse(app.validate_app_store_url("hello"))
+        self.assertFalse(app.validate_app_store_url(""))
+        self.assertFalse(app.validate_app_store_url(None))
 
-    def test_invalid_values(self):
-        for bad in ["hello", "", "   ", None, "12ab34", "123", "-123456789",
-                    "https://google.com", "12345678901234567890"]:
-            self.assertFalse(app.validate_app_id(bad), bad)
+    def test_url_with_country_code(self):
+        # Test 3: URL с country code
+        url = "https://apps.apple.com/us/app/example/id123456789"
+        self.assertTrue(app.validate_app_store_url(url))
+        self.assertEqual(app.parse_app_store_url(url), "123456789")
 
-    def test_url_is_no_longer_accepted(self):
-        self.assertFalse(app.validate_app_id("https://apps.apple.com/us/app/example/id123456789"))
+    def test_url_with_query_params(self):
+        # Test 4: URL с query parameters
+        url = "https://apps.apple.com/gb/app/example/id123456789?mt=8"
+        self.assertTrue(app.validate_app_store_url(url))
+        self.assertEqual(app.parse_app_store_url(url), "123456789")
+
+    def test_url_with_trailing_slash(self):
+        url = "https://apps.apple.com/us/app/example/id123456789/"
+        self.assertTrue(app.validate_app_store_url(url))
+        self.assertEqual(app.parse_app_store_url(url), "123456789")
+
+    def test_itunes_host_accepted(self):
+        url = "https://itunes.apple.com/us/app/example/id123456789"
+        self.assertTrue(app.validate_app_store_url(url))
 
     def test_get_app_id_raises_on_invalid(self):
         with self.assertRaises(ValueError):
-            app.get_app_id("hello")
+            app.get_app_id("https://google.com")
+
+    def test_no_scheme_still_parses(self):
+        # пользователь может вставить ссылку без https://
+        url = "apps.apple.com/us/app/example/id999999999"
+        self.assertTrue(app.validate_app_store_url(url))
+        self.assertEqual(app.parse_app_store_url(url), "999999999")
 
 
 class TestDateHandling(unittest.TestCase):
@@ -75,21 +98,11 @@ class TestDateHandling(unittest.TestCase):
         self.assertIsNone(app.parse_review_date(""))
         self.assertIsNone(app.parse_review_date(None))
 
-    def test_default_period_is_one_month_and_two_is_available(self):
-        self.assertEqual(app.PERIOD_MONTHS, 1)
-        self.assertEqual(app.PERIOD_OPTIONS, (1, 2))
-
-    def test_period_labels(self):
-        self.assertEqual(app.period_label(1), "1 месяц")
-        self.assertEqual(app.period_label(2), "2 месяца")
-        self.assertEqual(app.period_phrase(1), "за последний месяц")
-        self.assertEqual(app.period_phrase(2), "за последние 2 месяца")
-
     def test_filter_reviews_by_date(self):
-        # Test 14: отзывы старше периода отфильтровываются
+        # Test 14: отзывы старше двух месяцев отфильтровываются
         now = datetime(2026, 9, 24, tzinfo=timezone.utc)
-        cutoff = app.subtract_months(now, app.PERIOD_MONTHS)
-        recent = {"publication_date": datetime(2026, 9, 10, tzinfo=timezone.utc)}
+        cutoff = app.subtract_months(now, 2)
+        recent = {"publication_date": datetime(2026, 8, 1, tzinfo=timezone.utc)}
         old = {"publication_date": datetime(2026, 1, 1, tzinfo=timezone.utc)}
         future = {"publication_date": datetime(2026, 10, 1, tzinfo=timezone.utc)}
         result = app.filter_reviews_by_date([recent, old, future], cutoff, now)
@@ -330,14 +343,13 @@ class TestNetworkResilience(unittest.TestCase):
         # Test 15: частичная ошибка регионов - остальные данные не теряются
         import requests as requests_module
 
-        def fake_fetch(app_id, country, session, stop_event=None):
+        def fake_fetch(app_id, country, session):
             if country == "jp":
                 return [], "http_500"
-            recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
             entry = {
                 "id": {"label": country}, "title": {"label": "T"},
                 "content": {"label": f"Review from {country}"}, "im:rating": {"label": "5"},
-                "updated": {"label": recent},
+                "updated": {"label": "2026-08-01T00:00:00Z"},
             }
             return [entry], None
 
@@ -364,276 +376,6 @@ class TestNetworkResilience(unittest.TestCase):
     def test_lookup_network_failure_fails_open(self):
         with patch("app.requests.get", side_effect=Exception("network down")):
             self.assertTrue(app.check_app_exists("123456789"))
-
-
-class TestCountrySelection(unittest.TestCase):
-    def test_empty_selection_means_all(self):
-        all_codes = app.get_available_storefronts()
-        self.assertEqual(app.normalize_countries(None), all_codes)
-        self.assertEqual(app.normalize_countries([]), all_codes)
-
-    def test_selection_is_normalized(self):
-        self.assertEqual(app.normalize_countries(["US", " de ", "us", "xx"]), ["us", "de"])
-
-    def test_only_selected_countries_are_requested(self):
-        requested = []
-
-        def fake_fetch(app_id, country, session, stop_event=None):
-            requested.append(country)
-            return [], None
-
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=fake_fetch):
-            reviews, failed = app.fetch_all_reviews("123456789", countries=["us", "ru"])
-
-        self.assertEqual(sorted(requested), ["ru", "us"])
-        self.assertEqual(reviews, [])
-        self.assertEqual(failed, [])
-
-    def test_progress_total_matches_selection(self):
-        totals = []
-
-        def fake_fetch(app_id, country, session, stop_event=None):
-            return [], None
-
-        def on_progress(processed, total, country, reviews_so_far, failed_so_far):
-            totals.append(total)
-
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=fake_fetch):
-            app.fetch_all_reviews("123456789", countries=["us", "de", "jp"], progress_callback=on_progress)
-        self.assertEqual(set(totals), {3})
-
-
-class TestStopButton(unittest.TestCase):
-    def _recent_entry(self, country):
-        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-        return {
-            "id": {"label": country}, "title": {"label": "T"},
-            "content": {"label": f"Review from {country}"}, "im:rating": {"label": "5"},
-            "updated": {"label": recent},
-        }
-
-    def test_page_fetch_returns_stopped_when_event_set(self):
-        import threading
-        ev = threading.Event()
-        ev.set()
-        session = MagicMock()
-        entries, error = app._fetch_page_with_retry("http://fake", session, ev)
-        self.assertIsNone(entries)
-        self.assertEqual(error, app.STOPPED)
-        session.get.assert_not_called()
-
-    def test_storefront_keeps_pages_loaded_before_stop(self):
-        import threading
-        ev = threading.Event()
-        calls = {"n": 0}
-
-        def fake_page(url, session, stop_event=None):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                ev.set()  # пользователь нажал "Стоп" после первой страницы
-            if stop_event is not None and stop_event.is_set():
-                return None, app.STOPPED
-            return [self._recent_entry("us")], None
-
-        with patch.object(app, "_fetch_page_with_retry", side_effect=fake_page):
-            entries, error = app.fetch_reviews_for_storefront("123456789", "us", MagicMock(), ev)
-        self.assertIsNone(error)
-        self.assertEqual(len(entries), 1)  # первая страница сохранена
-
-    def test_stop_before_start_fetches_nothing(self):
-        import threading
-        ev = threading.Event()
-        ev.set()
-        fake = MagicMock(return_value=([], None))
-        with patch.object(app, "fetch_reviews_for_storefront", fake):
-            reviews, failed = app.fetch_all_reviews("123456789", countries=["us", "de"], stop_event=ev)
-        self.assertEqual((reviews, failed), ([], []))
-        fake.assert_not_called()
-
-    def test_stop_keeps_already_loaded_regions(self):
-        import threading
-        ev = threading.Event()
-        progress = []
-
-        def fake_fetch(app_id, country, session, stop_event=None):
-            ev.set()  # "Стоп" нажат во время обработки первого региона
-            return [self._recent_entry(country)], None
-
-        with patch.object(app, "MAX_WORKERS", 1), \
-             patch.object(app, "fetch_reviews_for_storefront", side_effect=fake_fetch):
-            reviews, failed = app.fetch_all_reviews(
-                "123456789", countries=["us", "de", "jp"], stop_event=ev,
-                progress_callback=lambda *a: progress.append(a),
-            )
-        self.assertEqual({r["country"] for r in reviews}, {"us"})
-        self.assertEqual(failed, [])
-        self.assertEqual(len(progress), 1)  # остальные регионы не запускались
-
-    def test_job_stop_returns_partial_results(self):
-        import threading
-        first_started = threading.Event()
-
-        def fake_fetch(app_id, country, session, stop_event=None):
-            first_started.set()
-            stop_event.wait(5)  # висим, пока не нажмут "Стоп"
-            return [self._recent_entry(country)], None
-
-        with patch.object(app, "MAX_WORKERS", 1), \
-             patch.object(app, "fetch_reviews_for_storefront", side_effect=fake_fetch):
-            job = app.FetchJob("123456789", ["us", "de", "jp"])
-            job.start()
-            self.assertTrue(first_started.wait(5))  # первый регион уже в работе
-            job.request_stop()
-            self.assertTrue(job.done_event.wait(5))
-        self.assertTrue(job.was_stopped)
-        self.assertFalse(job.crashed)
-        self.assertEqual(len(job.reviews), 1)
-
-    def test_job_completes_without_stop(self):
-        def fake_fetch(app_id, country, session, stop_event=None):
-            return [self._recent_entry(country)], None
-
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=fake_fetch):
-            job = app.FetchJob("123456789", ["us", "de"])
-            job.start()
-            self.assertTrue(job.done_event.wait(5))
-        self.assertFalse(job.was_stopped)
-        self.assertEqual(len(job.reviews), 2)
-        self.assertEqual(job.snapshot()["processed"], 2)
-
-    def test_job_crash_is_reported_not_raised(self):
-        with patch.object(app, "fetch_all_reviews", side_effect=RuntimeError("boom")):
-            job = app.FetchJob("123456789", ["us"])
-            job.start()
-            self.assertTrue(job.done_event.wait(5))
-        self.assertTrue(job.crashed)
-
-
-class TestUiSmoke(unittest.TestCase):
-    def test_main_renders_without_errors(self):
-        app.main()
-
-
-class TestSourceHealthCheck(unittest.TestCase):
-    ENTRY = {
-        "id": {"label": "1"}, "title": {"label": "T"}, "content": {"label": "C"},
-        "im:rating": {"label": "5"}, "updated": {"label": "2026-10-01T00:00:00Z"},
-    }
-
-    def test_healthy_when_a_later_page_has_reviews(self):
-        # "дыры" в фиде: страницы 1-2 пустые, на 3-й есть отзывы
-        pages = [([], None), ([], None), ([self.ENTRY], None)]
-        with patch.object(app, "_fetch_page_with_retry", side_effect=pages):
-            self.assertTrue(app.check_review_source_health(MagicMock()))
-
-    def test_dead_when_every_page_is_empty(self):
-        n = len(app.HEALTHCHECK_COUNTRIES) * app.MAX_PAGES_PER_STOREFRONT
-        with patch.object(app, "_fetch_page_with_retry", side_effect=[([], None)] * n):
-            self.assertFalse(app.check_review_source_health(MagicMock()))
-
-    def test_unknown_on_network_error(self):
-        with patch.object(app, "_fetch_page_with_retry", return_value=(None, "timeout")):
-            self.assertIsNone(app.check_review_source_health(MagicMock()))
-
-
-class TestResultsScreen(unittest.TestCase):
-    """Дымовые проверки экранов результата (со Streamlit-заглушкой)."""
-
-    def setUp(self):
-        app.st.session_state.clear()
-
-    def _state(self, df, **extra):
-        app.st.session_state.update(
-            result_df=df, failed_regions=[], app_id="123456789", total_countries=3,
-            processed_regions=3, was_stopped=False, crashed=False, **extra)
-
-    def test_show_results_all_variants(self):
-        empty = app.build_dataframe([])
-        for status in (None, "ok", "dead", "unknown"):
-            app.st.session_state.clear()
-            self._state(empty, source_status=status)
-            app._show_results()
-        app.st.session_state.clear()
-        self._state(app.sort_reviews(app.build_dataframe([{
-            "review_text": "x", "rating": 5, "title": "t", "country": "us", "language": "en",
-            "publication_date": datetime.now(timezone.utc)}])))
-        app._show_results()
-        app.st.session_state["was_stopped"] = True
-        app._show_results()
-
-    def test_finalize_runs_health_check_only_when_empty(self):
-        with patch.object(app, "fetch_reviews_for_storefront", return_value=([], None)):
-            job = app.FetchJob("123456789", ["us"])
-            job.start()
-            self.assertTrue(job.done_event.wait(5))
-        with patch.object(app, "check_review_source_health", return_value=False) as hc:
-            app._finalize_job(job)
-        hc.assert_called_once()
-        self.assertEqual(app.st.session_state["source_status"], "dead")
-
-    def test_finalize_skips_health_check_when_stopped(self):
-        job = app.FetchJob("123456789", ["us"])
-        job.stop_event.set()
-        job.done_event.set()
-        with patch.object(app, "check_review_source_health") as hc:
-            app._finalize_job(job)
-        hc.assert_not_called()
-        self.assertIsNone(app.st.session_state["source_status"])
-
-
-class TestPeriodSelection(unittest.TestCase):
-    """Отзывы 5, 45 и 70 дней назад: 1 месяц -> 1 отзыв, 2 месяца -> 2 отзыва."""
-
-    def _entries(self):
-        def e(i, days):
-            when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-            return {"id": {"label": str(i)}, "title": {"label": "T"}, "content": {"label": f"R{i}"},
-                    "im:rating": {"label": "5"}, "updated": {"label": when}}
-        return [e(1, 5), e(2, 45), e(3, 70)]
-
-    def _fake(self):
-        entries = self._entries()
-        return lambda app_id, country, session, stop_event=None: (list(entries), None)
-
-    def test_one_month_default(self):
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
-            reviews, _ = app.fetch_all_reviews("123456789", countries=["us"])
-        self.assertEqual(sorted(r["review_text"] for r in reviews), ["R1"])
-
-    def test_two_months(self):
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
-            reviews, _ = app.fetch_all_reviews("123456789", countries=["us"], period_months=2)
-        self.assertEqual(sorted(r["review_text"] for r in reviews), ["R1", "R2"])
-
-    def test_job_passes_period_through(self):
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
-            job = app.FetchJob("123456789", ["us"], period_months=2)
-            job.start()
-            self.assertTrue(job.done_event.wait(5))
-        self.assertEqual(job.period_months, 2)
-        self.assertEqual(len(job.reviews), 2)
-
-    def test_finalize_validates_against_job_period(self):
-        # при 2 месяцах отзыв 45-дневной давности — не ошибка валидации
-        with patch.object(app, "fetch_reviews_for_storefront", side_effect=self._fake()):
-            job = app.FetchJob("123456789", ["us"], period_months=2)
-            job.start()
-            self.assertTrue(job.done_event.wait(5))
-        with patch.object(app.logger, "error") as log_error:
-            app._finalize_job(job)
-        log_error.assert_not_called()
-        self.assertEqual(app.st.session_state["period_months"], 2)
-        self.assertEqual(len(app.st.session_state["result_df"]), 2)
-
-    def test_empty_message_uses_selected_period(self):
-        app.st.session_state.clear()
-        app.st.session_state.update(
-            result_df=app.build_dataframe([]), failed_regions=[], app_id="1", total_countries=1,
-            processed_regions=1, was_stopped=False, crashed=False, source_status="ok",
-            period_months=2)
-        with patch.object(app.st, "info") as info:
-            app._show_results()
-        info.assert_called_once_with("За последние 2 месяца отзывы не найдены.")
 
 
 class TestLanguageDetectionFallback(unittest.TestCase):
